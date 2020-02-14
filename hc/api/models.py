@@ -8,6 +8,7 @@ from datetime import datetime, timedelta as td
 from croniter import croniter
 from django.conf import settings
 from django.core.signing import TimestampSigner
+from django.core.validators import MinValueValidator
 from django.db import models
 from django.urls import reverse
 from django.utils import timezone
@@ -65,6 +66,7 @@ class Check(models.Model):
     tags = models.CharField(max_length=500, blank=True)
     code = models.UUIDField(default=uuid.uuid4, editable=False, unique=True)
     desc = models.TextField(blank=True)
+    num_processes = models.IntegerField(default=1, validators=[MinValueValidator(1)])
     project = models.ForeignKey(Project, models.CASCADE)
     created = models.DateTimeField(auto_now_add=True)
     kind = models.CharField(max_length=10, default="simple", choices=CHECK_KINDS)
@@ -95,6 +97,14 @@ class Check(models.Model):
             )
         ]
 
+    @property
+    def monitoring_single_process(self):
+        return self.num_processes == 1
+
+    @property
+    def monitoring_multiple_processes(self):
+        return self.num_processes != 1
+
     def __str__(self):
         return "%s (%d)" % (self.name or self.code, self.id)
 
@@ -123,28 +133,60 @@ class Check(models.Model):
         If the check is currently new, paused or down, return None.
 
         """
+        if self.monitoring_single_process:
+            last_ping = self.last_ping
+        else:
+            last_ping = Ping.get_last_process_ping_time(
+                self.id,
+                self.num_processes
+            )
 
         # NEVER is a constant sentinel value (year 3000).
         # Using None instead would make the logic clunky.
         result = NEVER
 
         if self.kind == "simple" and self.status == "up":
-            result = self.last_ping + self.timeout
+            result = last_ping + self.timeout
         elif self.kind == "cron" and self.status == "up":
             # The complex case, next ping is expected based on cron schedule.
             # Don't convert to naive datetimes (and so avoid ambiguities around
             # DST transitions). Croniter will handle the timezone-aware datetimes.
 
             zone = pytz.timezone(self.tz)
-            last_local = timezone.localtime(self.last_ping, zone)
+            last_local = timezone.localtime(last_ping, zone)
             it = croniter(self.schedule, last_local)
             result = it.next(datetime)
 
-        if self.last_start and self.status != "down":
+        if self.monitoring_single_process and self.last_start and self.status != "down":
             result = min(result, self.last_start)
 
         if result != NEVER:
             return result
+
+    def get_expected_next_ping_time(self):
+        """Return next ping expected datetime."""
+        if self.monitoring_single_process:
+            last_ping = self.last_ping
+        else:
+            last_ping = Ping.get_last_process_ping_time(
+                self.id,
+                self.num_processes
+            )
+
+        if not last_ping:
+            return timezone.make_aware(datetime.min)
+
+        if self.kind == "simple":
+            result = last_ping + self.timeout
+        elif self.kind == "cron":
+            # The complex case, next ping is expected based on cron schedule.
+            # Don't convert to naive datetimes (and so avoid ambiguities around
+            # DST transitions). Croniter will handle the timezone-aware datetimes.
+            zone = pytz.timezone(self.tz)
+            last_local = timezone.localtime(last_ping, zone)
+            it = croniter(self.schedule, last_local)
+            result = it.next(datetime)
+        return result
 
     def going_down_after(self):
         """ Return the datetime when the check goes down.
@@ -158,13 +200,27 @@ class Check(models.Model):
         if grace_start is not None:
             return grace_start + self.grace
 
+
+    def _compute_alive_status(self, now=None):
+        if now is None:
+            now = timezone.now()
+
+        next_ping_time = self.get_expected_next_ping_time()
+
+        grace_end = next_ping_time + self.grace
+        if now >= grace_end:
+            return "down"
+
+        return "up"
+
+
     def get_status(self, now=None, with_started=True):
         """ Return current status for display. """
 
         if now is None:
             now = timezone.now()
 
-        if self.last_start:
+        if self.last_start and self.monitoring_single_process:
             if now >= self.last_start + self.grace:
                 return "down"
             elif with_started:
@@ -174,6 +230,9 @@ class Check(models.Model):
             return self.status
 
         grace_start = self.get_grace_start()
+        if not grace_start:
+            return "down"
+
         grace_end = grace_start + self.grace
         if now >= grace_end:
             return "down"
@@ -235,7 +294,7 @@ class Check(models.Model):
 
         return result
 
-    def ping(self, remote_addr, scheme, method, ua, body, action):
+    def ping(self, remote_addr, scheme, method, ua, body, action, process_id=0):
         now = timezone.now()
 
         if action == "start":
@@ -245,29 +304,45 @@ class Check(models.Model):
             pass
         else:
             self.last_ping = now
-            if self.last_start:
-                self.last_duration = self.last_ping - self.last_start
+
+            last_start = None
+            if self.monitoring_single_process:
+                last_start = self.last_start
                 self.last_start = None
+            else:
+                latest_ping = Ping.get_latest_ping(self, process_id)
+                if latest_ping and latest_ping.kind == "start":
+                    last_start = latest_ping.created
+
+            if last_start:
+                self.last_duration = self.last_ping - last_start
             else:
                 self.last_duration = None
 
-            new_status = "down" if action == "fail" else "up"
-            if self.status != new_status:
-                flip = Flip(owner=self)
-                flip.created = self.last_ping
-                flip.old_status = self.status
-                flip.new_status = new_status
-                flip.save()
+            if action == "fail" or self.monitoring_single_process:
+                new_status = "down" if action == "fail" else "up"
+                if self.status != new_status:
+                    flip = Flip(
+                        owner=self,
+                        created=self.last_ping,
+                        old_status=self.status,
+                        new_status=new_status
+                    )
+                    flip.save()
 
-                self.status = new_status
+                    self.status = new_status
 
-        self.alert_after = self.going_down_after()
+        if self.monitoring_single_process:
+            # Monitoring only single process. So, we can calculate
+            # self.alert_after only on the basis of self.last_ping
+            self.alert_after = self.going_down_after()
         self.n_pings = models.F("n_pings") + 1
         self.has_confirmation_link = "confirm" in str(body).lower()
         self.save()
         self.refresh_from_db()
 
         ping = Ping(owner=self)
+        ping.process_id = process_id
         ping.n = self.n_pings
         ping.created = now
         if action in ("start", "fail", "ign"):
@@ -280,6 +355,26 @@ class Check(models.Model):
         ping.ua = ua[:200]
         ping.body = body[: settings.PING_BODY_LIMIT]
         ping.save()
+
+        if self.monitoring_multiple_processes:
+            if action != "fail":
+                new_status = self._compute_alive_status(now)
+                if self.status != new_status:
+                    flip = Flip(
+                        owner=self,
+                        created=self.last_ping,
+                        old_status=self.status,
+                        new_status=new_status
+                    )
+                    flip.save()
+
+                    self.status = new_status
+
+            # We are monitoring more than 1 process due to which
+            # self.alert_after can only be calculated after saving current ping.
+            # self.last_ping alone is not sufficient to calculate alert_after
+            self.alert_after = self.going_down_after()
+            self.save()
 
     def downtimes(self, months=3):
         """ Calculate the number of downtimes and downtime minutes per month.
@@ -322,6 +417,7 @@ class Check(models.Model):
 
 class Ping(models.Model):
     id = models.BigAutoField(primary_key=True)
+    process_id = models.IntegerField(default=0)
     n = models.IntegerField(null=True)
     owner = models.ForeignKey(Check, models.CASCADE)
     created = models.DateTimeField(default=timezone.now)
@@ -331,6 +427,51 @@ class Ping(models.Model):
     method = models.CharField(max_length=10, blank=True)
     ua = models.CharField(max_length=200, blank=True)
     body = models.TextField(blank=True, null=True)
+
+    @classmethod
+    def get_last_process_ping_time(cls, check_id, num_processes):
+        """Return latest ping time of last pinging process from
+        recent num_processes
+
+        Suppose we received following pings
+        process_id   time_of_ping
+                 2   09:50 AM
+                 1   10:00 AM
+                 3   10:05 AM
+                 1   10:10 AM
+                 3   10:11 AM
+
+        if num_processes = 3 than return 09:50 AM (process_id=2)
+
+        if num_processes = 2 than return 10:10 AM (process_id=1)
+        """
+        table_name = cls.objects.model._meta.db_table
+        query = cls.objects.raw(
+            f"""
+            SELECT id, process_id, MAX(created) as created
+            FROM {table_name}
+            WHERE kind IS NULL AND owner_id = %s
+            GROUP BY process_id
+            ORDER BY MAX(created) DESC
+            LIMIT %s
+            """, [check_id, num_processes]
+        )
+
+        pings_list = list(query)
+
+        if len(pings_list) == num_processes:
+            return min(ping.created for ping in query)
+
+        # Didn't received any ping yet or the actual number of processes
+        # pinging with this check code is smaller than num_processes
+        return timezone.make_aware(datetime.min)
+
+    @classmethod
+    def get_latest_ping(cls, check, process_id):
+        return cls.objects.filter(
+            owner=check,
+            process_id=process_id
+        ).order_by('-created').first()
 
 
 class Channel(models.Model):
@@ -710,7 +851,7 @@ class Flip(models.Model):
             return []
 
         if self.new_status not in ("up", "down"):
-            raise NotImplementedError("Unexpected status: %s" % self.status)
+            raise NotImplementedError("Unexpected status: %s" % self.new_status)
 
         errors = []
         for channel in self.owner.channel_set.all():

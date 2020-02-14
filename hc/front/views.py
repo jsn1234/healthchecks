@@ -331,6 +331,7 @@ def update_name(request, code):
         check.name = form.cleaned_data["name"]
         check.tags = form.cleaned_data["tags"]
         check.desc = form.cleaned_data["desc"]
+        check.num_processes = form.cleaned_data["num_processes"]
         check.save()
 
     if "/details/" in request.META.get("HTTP_REFERER", ""):
@@ -464,14 +465,18 @@ def _get_events(check, limit):
     pings = Ping.objects.filter(owner=check).order_by("-id")[:limit]
     pings = list(pings)
 
-    prev = None
+    prev_pings = {}
     for ping in pings:
-        if ping.kind == "start" and prev and prev.kind != "start":
-            delta = prev.created - ping.created
-            if delta < MAX_DELTA:
-                setattr(prev, "delta", delta)
+        pid = ping.process_id
 
-        prev = ping
+        if ping.kind == "start":
+            prev = prev_pings.get(pid)
+            if prev and prev.kind != "start":
+                delta = prev.created - ping.created
+                if delta < MAX_DELTA:
+                    setattr(prev, "delta", delta)
+
+        prev_pings[pid] = ping
 
     alerts = []
     if len(pings):

@@ -18,6 +18,13 @@ $(function () {
         return false;
     });
 
+    $("#edit-num-processes").click(function() {
+        $('#update-name-modal').modal("show");
+        $("#update-num-processes-input").focus();
+
+        return false;
+    });
+
     $("#pause").click(function(e) {
         $("#pause-form").submit();
         return false;

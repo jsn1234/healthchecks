@@ -61,6 +61,9 @@
                 <span class="label label-success">OK</span>
                 {% endif %}
             </td>
+            <td>
+                <span class="label label-tag">{{ event.process_id }}</span>
+            </td>
             <td class="details">
                 {% if event.delta %}
                 <div class="delta">
@@ -102,7 +105,7 @@
             </td>
             <td class="date"></td>
             <td class="time"></td>
-            <td class="alert-info" colspan="2">
+            <td class="alert-info" colspan="3">
                 {% include "front/event_summary.html" %}
             </td>
         </tr>

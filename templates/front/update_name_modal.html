@@ -1,10 +1,7 @@
 <div id="update-name-modal" class="modal">
     <div class="modal-dialog">
-        <form
-            id="update-name-form"
-            {% if check %}action="{% url 'hc-update-name' check.code %}"{% endif %}
-            class="form-horizontal"
-            method="post">
+        <form id="update-name-form" {% if check %}action="{% url 'hc-update-name' check.code %}" {% endif %}
+            class="form-horizontal" method="post">
             {% csrf_token %}
             <div class="modal-content">
                 <div class="modal-header">
@@ -66,6 +63,26 @@
                                 placeholder="Additional notes for your own reference.
 Will appear in email alerts about this check going DOWN and in Slack notifications."
                                 name="desc">{{ check.desc }}</textarea>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="update-num-processes-input" class="col-sm-2 control-label">
+                            Processes
+                        </label>
+                        <div class="col-sm-10">
+                            <input
+                                id="update-num-processes-input"
+                                name="num_processes"
+                                type="number"
+                                min="1"
+                                value="{{ check.num_processes }}"
+                                placeholder="1"
+                                class="form-control" />
+
+                            <span class="help-block">
+                                Number of processes running in parallel and pinging the server with this check id.
+                            </span>
                         </div>
                     </div>
                 </div>

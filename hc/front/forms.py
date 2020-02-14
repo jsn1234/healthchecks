@@ -50,6 +50,7 @@ class NameTagsForm(forms.Form):
     name = forms.CharField(max_length=100, required=False)
     tags = forms.CharField(max_length=500, required=False)
     desc = forms.CharField(required=False)
+    num_processes = forms.IntegerField(min_value=1, initial=1)
 
     def clean_tags(self):
         result = []
